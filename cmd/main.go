@@ -42,6 +42,7 @@ func NewApplication() *Application {
 func (app *Application) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", app.healthHandler)
 	mux.HandleFunc("/register", app.Hnd.Register)
+	mux.HandleFunc("/login", app.Hnd.Login)
 }
 
 // HealthHandler handles GET /health endpoint.

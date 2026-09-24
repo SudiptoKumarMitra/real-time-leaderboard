@@ -33,8 +33,6 @@ type RegisterResponse struct {
 }
 
 // Register handles POST /register.
-// It expects a JSON body with name, email, and password.
-// It delegates business logic to the UserService.
 func (h *UserHandler) Register(w http.ResponseWriter, r *http.Request) {
 	// Accept only POST method
 	if r.Method != http.MethodPost {

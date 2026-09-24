@@ -17,6 +17,7 @@ var ErrDuplicateEmail = errors.New("duplicate email")
 
 // ErrInvalidInput is returned when required fields are missing.
 var ErrInvalidInput = errors.New("invalid input: email and password are required")
+var ErrAuthFailed = errors.New("authentication failed")
 
 // UserService handles registration business logic.
 type UserService struct {
@@ -78,4 +79,46 @@ func (s *UserService) Register(name, email, password string) (int, error) {
 	}
 
 	return userID, nil
+}
+
+// Login performs user login authentication logic.
+//
+// Parameters:
+//
+//	email: user's email address
+//	password: plain-text password from the HTTP request
+//
+// Returns:
+//
+//	userID: the authenticated user's ID (on success)
+//	err: nil on success, or ErrAuthFailed if email/password are invalid
+//
+// Business rules applied:
+//   - Email and password must not be empty
+//   - User is looked up by email from the database
+//   - If user not found, ErrAuthFailed is returned (do not reveal why)
+//   - If password does not match the stored bcrypt hash, ErrAuthFailed is returned
+//     (do not reveal if it was the email or password that was wrong)
+//   - The password is verified using bcrypt.CompareHashAndPassword
+func (s *UserService) Login(email, password string) (int, error) {
+	// Basic validation: email and password must not be empty
+	if email == "" || password == "" {
+		return 0, ErrInvalidInput
+	}
+
+	// Call repository to find user by email
+	user, err := s.repo.FindByEmail(email)
+	if err != nil {
+		// User not found - return generic auth error
+		return 0, ErrAuthFailed
+	}
+
+	// Verify password using bcrypt comparison
+	err = bcrypt.CompareHashAndPassword([]byte(user.Hash), []byte(password))
+	if err != nil {
+		// Password mismatch - return generic auth error
+		return 0, ErrAuthFailed
+	}
+
+	return user.ID, nil
 }
