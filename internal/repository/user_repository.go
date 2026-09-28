@@ -8,6 +8,17 @@ import (
 // ErrDuplicateEmail is returned when the email already exists in the database.
 var ErrDuplicateEmail = errors.New("duplicate email")
 
+// ErrUserNotFound is returned when a user with the given email does not exist.
+var ErrUserNotFound = errors.New("user not found")
+
+// User represents a user account returned from the repository.
+type User struct {
+	ID    int
+	Name  string
+	Email string
+	Hash  string
+}
+
 // UserRepository handles database operations for user accounts.
 type UserRepository struct {
 	DB *sql.DB
@@ -16,6 +27,22 @@ type UserRepository struct {
 // NewUserRepository creates a new UserRepository with the given database connection pool.
 func NewUserRepository(db *sql.DB) *UserRepository {
 	return &UserRepository{DB: db}
+}
+
+// FindByEmail retrieves a user by email from the PostgreSQL users table.
+// Returns ErrUserNotFound if no user matches the given email.
+func (r *UserRepository) FindByEmail(email string) (*User, error) {
+	const query = `SELECT id, name, email, password_hash FROM users WHERE email = $1`
+
+	var u User
+	err := r.DB.QueryRow(query, email).Scan(&u.ID, &u.Name, &u.Email, &u.Hash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return &u, nil
 }
 
 // CreateUser inserts a new user into the PostgreSQL users table.

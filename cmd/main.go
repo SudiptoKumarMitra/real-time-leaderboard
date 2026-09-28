@@ -15,25 +15,25 @@ import (
 
 // Application holds the shared application state, including the database connection pool.
 type Application struct {
-	DB  *sql.DB
-	Hnd *handler.UserHandler
+	DB        *sql.DB
+	Hnd       *handler.UserHandler
+	JWTSecret string
 }
 
 // NewApplication initializes the application with a database connection pool and handler.
-// It calls db.InitDB() and returns an Application struct ready to serve requests.
-// The database pool remains alive for the entire lifetime of the HTTP server;
-// it is the responsibility of main() to close the pool when the application shuts down.
 func NewApplication() *Application {
 	databasePool := db.InitDB()
 
 	// Create repository, service, and handler layers
+	jwtSecret := service.GetJWTSecret()
 	repo := repository.NewUserRepository(databasePool)
-	svc := service.NewUserService(*repo)
+	svc := service.NewUserService(*repo, jwtSecret)
 	hnd := handler.NewUserHandler(svc)
 
 	return &Application{
-		DB:  databasePool,
-		Hnd: hnd,
+		DB:        databasePool,
+		Hnd:       hnd,
+		JWTSecret: jwtSecret,
 	}
 }
 
@@ -42,6 +42,7 @@ func NewApplication() *Application {
 func (app *Application) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", app.healthHandler)
 	mux.HandleFunc("/register", app.Hnd.Register)
+	mux.HandleFunc("/login", app.Hnd.Login)
 }
 
 // HealthHandler handles GET /health endpoint.
@@ -75,6 +76,7 @@ func main() {
 	fmt.Printf("Server starting on http://localhost:%s\n", port)
 	fmt.Printf("Health endpoint: GET /health\n")
 	fmt.Printf("Register endpoint: POST /register\n")
+	fmt.Printf("Login endpoint: POST /login\n")
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Error starting HTTP server: %v", err)
