@@ -9,6 +9,7 @@ import (
 
 	"real_time_leaderboard/db"
 	"real_time_leaderboard/internal/handler"
+	"real_time_leaderboard/internal/middleware"
 	"real_time_leaderboard/internal/repository"
 	"real_time_leaderboard/internal/service"
 )
@@ -17,6 +18,7 @@ import (
 type Application struct {
 	DB        *sql.DB
 	Hnd       *handler.UserHandler
+	ScHnd     *handler.ScoreHandler
 	JWTSecret string
 }
 
@@ -26,13 +28,18 @@ func NewApplication() *Application {
 
 	// Create repository, service, and handler layers
 	jwtSecret := service.GetJWTSecret()
-	repo := repository.NewUserRepository(databasePool)
-	svc := service.NewUserService(*repo, jwtSecret)
-	hnd := handler.NewUserHandler(svc)
+	userRepo := repository.NewUserRepository(databasePool)
+	userSvc := service.NewUserService(*userRepo, jwtSecret)
+	userHnd := handler.NewUserHandler(userSvc)
+
+	scoreRepo := repository.NewScoreRepository(databasePool)
+	scoreSvc := service.NewScoreService(*scoreRepo)
+	scoreHnd := handler.NewScoreHandler(scoreSvc)
 
 	return &Application{
 		DB:        databasePool,
-		Hnd:       hnd,
+		Hnd:       userHnd,
+		ScHnd:     scoreHnd,
 		JWTSecret: jwtSecret,
 	}
 }
@@ -40,9 +47,13 @@ func NewApplication() *Application {
 // RegisterRoutes registers HTTP handlers onto the given servemux.
 // This keeps the main() function clean and centralizes route configuration.
 func (app *Application) RegisterRoutes(mux *http.ServeMux) {
+	// Public routes — no JWT required
 	mux.HandleFunc("/health", app.healthHandler)
 	mux.HandleFunc("/register", app.Hnd.Register)
 	mux.HandleFunc("/login", app.Hnd.Login)
+
+	// Protected routes — JWT middleware verifies token before handler runs
+	mux.HandleFunc("/scores", middleware.JWTAuth(app.JWTSecret)(app.ScHnd.Submit))
 }
 
 // HealthHandler handles GET /health endpoint.
@@ -77,6 +88,7 @@ func main() {
 	fmt.Printf("Health endpoint: GET /health\n")
 	fmt.Printf("Register endpoint: POST /register\n")
 	fmt.Printf("Login endpoint: POST /login\n")
+	fmt.Printf("Score endpoint: POST /scores (authenticated)\n")
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Error starting HTTP server: %v", err)
