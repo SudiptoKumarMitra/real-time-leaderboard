@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/redis/go-redis/v9"
+
 	"real_time_leaderboard/db"
 	"real_time_leaderboard/internal/handler"
 	"real_time_leaderboard/internal/middleware"
@@ -17,6 +19,7 @@ import (
 // Application holds the shared application state, including the database connection pool.
 type Application struct {
 	DB        *sql.DB
+	Redis     *redis.Client
 	Hnd       *handler.UserHandler
 	ScHnd     *handler.ScoreHandler
 	JWTSecret string
@@ -25,6 +28,7 @@ type Application struct {
 // NewApplication initializes the application with a database connection pool and handler.
 func NewApplication() *Application {
 	databasePool := db.InitDB()
+	redisClient := db.InitRedis()
 
 	// Create repository, service, and handler layers
 	jwtSecret := service.GetJWTSecret()
@@ -33,11 +37,13 @@ func NewApplication() *Application {
 	userHnd := handler.NewUserHandler(userSvc)
 
 	scoreRepo := repository.NewScoreRepository(databasePool)
-	scoreSvc := service.NewScoreService(*scoreRepo)
+	lbRepo := repository.NewLeaderboardRepository(redisClient)
+	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo)
 	scoreHnd := handler.NewScoreHandler(scoreSvc)
 
 	return &Application{
 		DB:        databasePool,
+		Redis:     redisClient,
 		Hnd:       userHnd,
 		ScHnd:     scoreHnd,
 		JWTSecret: jwtSecret,
@@ -97,4 +103,5 @@ func main() {
 	// The HTTP server has stopped (e.g., via Ctrl+C).
 	// Close the database pool to clean up PostgreSQL connections.
 	db.CloseDB(app.DB)
+	db.CloseRedis(app.Redis)
 }

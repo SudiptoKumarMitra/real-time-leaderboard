@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"log"
 
 	"real_time_leaderboard/internal/repository"
 )
@@ -14,12 +15,16 @@ var ErrInvalidScore = errors.New("score must be an integer between 0 and 1000000
 
 // ScoreService handles score submission business logic.
 type ScoreService struct {
-	repo repository.ScoreRepository
+	repo   repository.ScoreRepository
+	lbRepo repository.LeaderboardRepository
 }
 
-// NewScoreService creates a new ScoreService with the given repository.
-func NewScoreService(repo repository.ScoreRepository) *ScoreService {
-	return &ScoreService{repo: repo}
+// NewScoreService creates a new ScoreService with the given repositories.
+//
+// repo persists score history (PostgreSQL, source of truth).
+// lbRepo maintains the leaderboard projection (Redis Sorted Set).
+func NewScoreService(repo repository.ScoreRepository, lbRepo repository.LeaderboardRepository) *ScoreService {
+	return &ScoreService{repo: repo, lbRepo: lbRepo}
 }
 
 // SubmitScore validates the score against business rules and persists it.
@@ -30,6 +35,11 @@ func NewScoreService(repo repository.ScoreRepository) *ScoreService {
 //   - score 0 is accepted
 //   - every submission creates a new row (history preserved)
 //
+// Persistence order: PostgreSQL first (source of truth), then Redis
+// (derived leaderboard, ZADD ... GT so a lower score never reduces the best).
+// A Redis failure is only logged — the submission still succeeds because the
+// score is durably stored in PostgreSQL.
+//
 // The userID comes from the verified JWT context — never from the request body.
 func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
 	// Validate business rules
@@ -37,10 +47,18 @@ func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
 		return 0, ErrInvalidScore
 	}
 
-	// Persist the score
+	// Step 1: PostgreSQL — durable history. Failure here fails the submission.
 	scoreID, err := s.repo.InsertScore(userID, score)
 	if err != nil {
 		return 0, errors.New("database error while saving score")
+	}
+
+	// Step 2: Redis — leaderboard projection (best score only).
+	// Runs strictly after a successful INSERT so Redis never claims a score
+	// that PostgreSQL does not have. Failure is non-fatal: the projection
+	// is rebuildable and will self-heal on the next higher score.
+	if err := s.lbRepo.UpdateBestScore(userID, score); err != nil {
+		log.Printf("warning: failed to update leaderboard for user %d score %d: %v", userID, score, err)
 	}
 
 	return scoreID, nil
