@@ -86,3 +86,63 @@ func (h *LeaderboardHandler) GetLeaderboard(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
 }
+
+// UserRankResponse is the JSON body of GET /leaderboard/{userID}/rank.
+// Rank/BestScore are pointers so they can be omitted for unranked users
+// (a nil pointer is omitted; a legitimate score of 0 is still emitted).
+type UserRankResponse struct {
+	UserID    int    `json:"user_id"`
+	Ranked    bool   `json:"ranked"`
+	Rank      *int   `json:"rank,omitempty"`
+	BestScore *int   `json:"best_score,omitempty"`
+	Message   string `json:"message,omitempty"`
+}
+
+// GetUserRank handles GET /leaderboard/{userID}/rank.
+//
+// Handler responsibilities:
+//   - accept only GET
+//   - parse and validate the path userID (positive integer, else 400)
+//   - call ScoreService.GetUserRank
+//   - format the JSON response:
+//     ranked   → 200 with 1-based rank and best_score
+//     unranked → 200 with ranked=false and an explicit message
+//     Redis failure → 500
+//
+// No Redis commands and no SQL live here.
+func (h *LeaderboardHandler) GetUserRank(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rawID := r.PathValue("userID")
+	userID, err := strconv.Atoi(rawID)
+	if err != nil || userID <= 0 {
+		http.Error(w, "invalid user id", http.StatusBadRequest)
+		return
+	}
+
+	result, err := h.Service.GetUserRank(userID)
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	resp := UserRankResponse{
+		UserID: result.UserID,
+		Ranked: result.Ranked,
+	}
+	if result.Ranked {
+		rank := result.Rank
+		score := result.Score
+		resp.Rank = &rank
+		resp.BestScore = &score
+	} else {
+		resp.Message = "user is not currently ranked"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(resp)
+}

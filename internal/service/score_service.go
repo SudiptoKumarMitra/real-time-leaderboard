@@ -130,3 +130,50 @@ func (s *ScoreService) GetLeaderboard(limit int) ([]LeaderboardRow, error) {
 	}
 	return rows, nil
 }
+
+// UserRank is the ranking for a single user.
+// Ranked=false means the user has no entry in the Redis leaderboard —
+// a normal state (200), not an error.
+type UserRank struct {
+	UserID int
+	Ranked bool
+	Rank   int // 1-based API rank; meaningful only when Ranked is true
+	Score  int // best score from Redis; meaningful only when Ranked is true
+}
+
+// GetUserRank returns the user's current leaderboard position and best score.
+//
+// Reads come ONLY from the Redis projection (ZREVRANK + ZSCORE) — no
+// PostgreSQL lookup, because the zset already holds the authoritative
+// current ranking state. Redis's 0-based rank is converted to the 1-based
+// API rank here (apiRank = redisRank + 1); the raw value never leaves
+// this layer.
+//
+// A user missing from the zset maps to repository.ErrNotRanked and is
+// returned as UserRank{Ranked: false} — NOT rank 1. Real Redis failures
+// propagate as errors so the handler can respond 500.
+func (s *ScoreService) GetUserRank(userID int) (UserRank, error) {
+	redisRank, err := s.lbRepo.GetRank(userID)
+	if errors.Is(err, repository.ErrNotRanked) {
+		return UserRank{UserID: userID, Ranked: false}, nil
+	}
+	if err != nil {
+		return UserRank{}, err
+	}
+
+	best, err := s.lbRepo.GetBestScore(userID)
+	if errors.Is(err, repository.ErrNotRanked) {
+		// Member removed between the two commands — treat as unranked.
+		return UserRank{UserID: userID, Ranked: false}, nil
+	}
+	if err != nil {
+		return UserRank{}, err
+	}
+
+	return UserRank{
+		UserID: userID,
+		Ranked: true,
+		Rank:   redisRank + 1, // 0-based Redis rank → 1-based API rank
+		Score:  int(best),
+	}, nil
+}

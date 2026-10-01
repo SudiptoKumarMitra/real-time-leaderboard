@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -11,6 +12,11 @@ import (
 // leaderboardKey is the Redis Sorted Set key that holds the leaderboard.
 // The key may not be a Go const because it is a string literal used in commands.
 const leaderboardKey = "leaderboard"
+
+// ErrNotRanked indicates the user has no entry in the leaderboard zset.
+// It is a normal state (never submitted, or Redis projection missing),
+// not an operational failure — callers respond 200, not 500.
+var ErrNotRanked = errors.New("user is not ranked in the leaderboard")
 
 // LeaderboardEntry is one row of leaderboard data: a user's best score.
 // It is shared by the Redis fast path and the PostgreSQL fallback path.
@@ -93,4 +99,48 @@ func (r *LeaderboardRepository) GetTopN(limit int) ([]LeaderboardEntry, error) {
 		})
 	}
 	return entries, nil
+}
+
+// GetRank returns the user's 0-based descending rank in the leaderboard.
+//
+// Command: ZREVRANK leaderboard <user_id>
+//
+// The returned value counts members with strictly higher scores: 0 means
+// best. Redis replies nil for members absent from the sorted set, which
+// go-redis surfaces as redis.Nil — translated here to ErrNotRanked so
+// callers never deal with protocol-level errors. Any other error is a real
+// Redis failure (unreachable, timeout, WRONGTYPE) and must propagate.
+func (r *LeaderboardRepository) GetRank(userID int) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	rank, err := r.Redis.ZRevRank(ctx, leaderboardKey, strconv.Itoa(userID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, ErrNotRanked
+	}
+	if err != nil {
+		return 0, err
+	}
+	return int(rank), nil
+}
+
+// GetBestScore returns the user's best score from the leaderboard projection.
+//
+// Command: ZSCORE leaderboard <user_id>
+//
+// O(1) hash-table lookup of the member's score — the value maintained by
+// the write path's ZADD ... GT (highest score only). Missing member is
+// translated to ErrNotRanked, same contract as GetRank.
+func (r *LeaderboardRepository) GetBestScore(userID int) (float64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	score, err := r.Redis.ZScore(ctx, leaderboardKey, strconv.Itoa(userID)).Result()
+	if errors.Is(err, redis.Nil) {
+		return 0, ErrNotRanked
+	}
+	if err != nil {
+		return 0, err
+	}
+	return score, nil
 }

@@ -61,6 +61,7 @@ func (app *Application) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/register", app.Hnd.Register)
 	mux.HandleFunc("/login", app.Hnd.Login)
 	mux.HandleFunc("/leaderboard", app.LbHnd.GetLeaderboard)
+	mux.HandleFunc("/leaderboard/{userID}/rank", app.LbHnd.GetUserRank)
 
 	// Protected routes — JWT middleware verifies token before handler runs
 	mux.HandleFunc("/scores", middleware.JWTAuth(app.JWTSecret)(app.ScHnd.Submit))
