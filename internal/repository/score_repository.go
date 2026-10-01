@@ -32,3 +32,42 @@ func (r *ScoreRepository) InsertScore(userID, score int) (int, error) {
 	}
 	return id, nil
 }
+
+// GetTopBestScores computes the top `limit` users by highest score from
+// PostgreSQL alone — the fallback path when the Redis leaderboard is empty
+// or unavailable.
+//
+// SELECT user_id, MAX(score) AS best_score
+// FROM scores
+// GROUP BY user_id
+// ORDER BY best_score DESC
+// LIMIT $1
+//
+// Returns rows already sorted descending, identical in shape to the Redis
+// fast path (LeaderboardEntry) so the service can merge names the same way.
+func (r *ScoreRepository) GetTopBestScores(limit int) ([]LeaderboardEntry, error) {
+	const query = `SELECT user_id, MAX(score) AS best_score
+		FROM scores
+		GROUP BY user_id
+		ORDER BY best_score DESC
+		LIMIT $1`
+
+	rows, err := r.DB.Query(query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]LeaderboardEntry, 0, limit)
+	for rows.Next() {
+		var e LeaderboardEntry
+		if err := rows.Scan(&e.UserID, &e.Score); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}

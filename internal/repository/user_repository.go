@@ -3,6 +3,8 @@ package repository
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 )
 
 // ErrDuplicateEmail is returned when the email already exists in the database.
@@ -71,4 +73,51 @@ func (r *UserRepository) CreateUser(name, email, passwordHash string) (int, erro
 	}
 
 	return id, nil
+}
+
+// GetNamesByIDs fetches names for a set of user IDs in ONE query.
+//
+// SELECT id, name FROM users WHERE id IN ($1, $2, ..., $n)
+//
+// This avoids the N+1 anti-pattern: a single round trip regardless of how
+// many leaderboard rows need names. Placeholders are built per element and
+// values are passed as query arguments (still parameterized — no string
+// interpolation of data, so no SQL injection).
+//
+// Returns a map keyed by user ID for O(1) merging with ranking results.
+// IDs not found (e.g. deleted users still lingering in Redis) are simply
+// absent from the map. An empty id list short-circuits without querying.
+func (r *UserRepository) GetNamesByIDs(ids []int) (map[int]string, error) {
+	names := make(map[int]string, len(ids))
+	if len(ids) == 0 {
+		return names, nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(`SELECT id, name FROM users WHERE id IN (%s)`, strings.Join(placeholders, ","))
+
+	rows, err := r.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		names[id] = name
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
 }

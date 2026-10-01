@@ -22,6 +22,7 @@ type Application struct {
 	Redis     *redis.Client
 	Hnd       *handler.UserHandler
 	ScHnd     *handler.ScoreHandler
+	LbHnd     *handler.LeaderboardHandler
 	JWTSecret string
 }
 
@@ -38,14 +39,16 @@ func NewApplication() *Application {
 
 	scoreRepo := repository.NewScoreRepository(databasePool)
 	lbRepo := repository.NewLeaderboardRepository(redisClient)
-	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo)
+	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo, *userRepo)
 	scoreHnd := handler.NewScoreHandler(scoreSvc)
+	lbHnd := handler.NewLeaderboardHandler(scoreSvc)
 
 	return &Application{
 		DB:        databasePool,
 		Redis:     redisClient,
 		Hnd:       userHnd,
 		ScHnd:     scoreHnd,
+		LbHnd:     lbHnd,
 		JWTSecret: jwtSecret,
 	}
 }
@@ -57,6 +60,7 @@ func (app *Application) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", app.healthHandler)
 	mux.HandleFunc("/register", app.Hnd.Register)
 	mux.HandleFunc("/login", app.Hnd.Login)
+	mux.HandleFunc("/leaderboard", app.LbHnd.GetLeaderboard)
 
 	// Protected routes — JWT middleware verifies token before handler runs
 	mux.HandleFunc("/scores", middleware.JWTAuth(app.JWTSecret)(app.ScHnd.Submit))
@@ -95,6 +99,7 @@ func main() {
 	fmt.Printf("Register endpoint: POST /register\n")
 	fmt.Printf("Login endpoint: POST /login\n")
 	fmt.Printf("Score endpoint: POST /scores (authenticated)\n")
+	fmt.Printf("Leaderboard endpoint: GET /leaderboard\n")
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Error starting HTTP server: %v", err)

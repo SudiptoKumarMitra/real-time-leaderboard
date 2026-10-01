@@ -12,6 +12,13 @@ import (
 // The key may not be a Go const because it is a string literal used in commands.
 const leaderboardKey = "leaderboard"
 
+// LeaderboardEntry is one row of leaderboard data: a user's best score.
+// It is shared by the Redis fast path and the PostgreSQL fallback path.
+type LeaderboardEntry struct {
+	UserID int
+	Score  int
+}
+
 // LeaderboardRepository handles Redis operations for the leaderboard.
 //
 // The leaderboard is a Redis Sorted Set:
@@ -50,4 +57,40 @@ func (r *LeaderboardRepository) UpdateBestScore(userID int, score int) error {
 		Score:  float64(score),
 		Member: strconv.Itoa(userID),
 	}).Err()
+}
+
+// GetTopN returns the top `limit` entries ordered by best score, descending.
+//
+// Command: ZREVRANGE leaderboard 0 (limit-1) WITHSCORES
+//
+// Redis returns members in descending score order with scores inline, so
+// no per-member follow-up query is needed. A missing key yields an empty
+// slice (not an error) — the service treats that as a cache miss and
+// falls back to PostgreSQL. Parse failures skip the offending member
+// rather than failing the whole read.
+func (r *LeaderboardRepository) GetTopN(limit int) ([]LeaderboardEntry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	results, err := r.Redis.ZRevRangeWithScores(ctx, leaderboardKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	entries := make([]LeaderboardEntry, 0, len(results))
+	for _, z := range results {
+		member, ok := z.Member.(string)
+		if !ok {
+			continue
+		}
+		userID, err := strconv.Atoi(member)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, LeaderboardEntry{
+			UserID: userID,
+			Score:  int(z.Score),
+		})
+	}
+	return entries, nil
 }
