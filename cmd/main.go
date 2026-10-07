@@ -12,6 +12,7 @@ import (
 	"real_time_leaderboard/db"
 	"real_time_leaderboard/internal/handler"
 	"real_time_leaderboard/internal/middleware"
+	"real_time_leaderboard/internal/publisher"
 	"real_time_leaderboard/internal/repository"
 	"real_time_leaderboard/internal/service"
 )
@@ -20,6 +21,7 @@ import (
 type Application struct {
 	DB        *sql.DB
 	Redis     *redis.Client
+	Publisher *publisher.EventPublisher
 	Hnd       *handler.UserHandler
 	ScHnd     *handler.ScoreHandler
 	LbHnd     *handler.LeaderboardHandler
@@ -39,13 +41,15 @@ func NewApplication() *Application {
 
 	scoreRepo := repository.NewScoreRepository(databasePool)
 	lbRepo := repository.NewLeaderboardRepository(redisClient)
-	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo, *userRepo)
+	eventPub := publisher.NewEventPublisher()
+	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo, *userRepo, eventPub)
 	scoreHnd := handler.NewScoreHandler(scoreSvc)
 	lbHnd := handler.NewLeaderboardHandler(scoreSvc)
 
 	return &Application{
 		DB:        databasePool,
 		Redis:     redisClient,
+		Publisher: eventPub,
 		Hnd:       userHnd,
 		ScHnd:     scoreHnd,
 		LbHnd:     lbHnd,
@@ -107,7 +111,9 @@ func main() {
 	}
 
 	// The HTTP server has stopped (e.g., via Ctrl+C).
-	// Close the database pool to clean up PostgreSQL connections.
+	// Close the database pool, Redis client, and Kafka writer to clean up
+	// their pooled connections.
 	db.CloseDB(app.DB)
 	db.CloseRedis(app.Redis)
+	app.Publisher.Close()
 }

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"database/sql"
+	"time"
 )
 
 // ScoreRepository handles database operations for score submissions.
@@ -21,16 +22,21 @@ func NewScoreRepository(db *sql.DB) *ScoreRepository {
 // Score 0 is accepted (no CHECK constraint).
 //
 // Uses parameterized placeholders ($1, $2) to prevent SQL injection.
-// Returns the newly created score ID on success.
-func (r *ScoreRepository) InsertScore(userID, score int) (int, error) {
-	const query = `INSERT INTO scores (user_id, score) VALUES ($1, $2) RETURNING id`
+//
+// Returns the newly created score ID and the row's created_at exactly as
+// PostgreSQL stored it (RETURNING id, created_at). The timestamp comes from
+// the database — never from time.Now() in the caller — because it identifies
+// the committed row for downstream events.
+func (r *ScoreRepository) InsertScore(userID, score int) (int, time.Time, error) {
+	const query = `INSERT INTO scores (user_id, score) VALUES ($1, $2) RETURNING id, created_at`
 
 	var id int
-	err := r.DB.QueryRow(query, userID, score).Scan(&id)
+	var createdAt time.Time
+	err := r.DB.QueryRow(query, userID, score).Scan(&id, &createdAt)
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
-	return id, nil
+	return id, createdAt, nil
 }
 
 // GetTopBestScores computes the top `limit` users by highest score from

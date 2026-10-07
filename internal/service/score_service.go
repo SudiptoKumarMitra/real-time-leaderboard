@@ -1,9 +1,12 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"log"
+	"time"
 
+	"real_time_leaderboard/internal/publisher"
 	"real_time_leaderboard/internal/repository"
 )
 
@@ -15,18 +18,21 @@ var ErrInvalidScore = errors.New("score must be an integer between 0 and 1000000
 
 // ScoreService handles score submission business logic.
 type ScoreService struct {
-	repo     repository.ScoreRepository
-	lbRepo   repository.LeaderboardRepository
-	userRepo repository.UserRepository
+	repo      repository.ScoreRepository
+	lbRepo    repository.LeaderboardRepository
+	userRepo  repository.UserRepository
+	publisher *publisher.EventPublisher
 }
 
-// NewScoreService creates a new ScoreService with the given repositories.
+// NewScoreService creates a new ScoreService with the given dependencies.
 //
 // repo persists score history (PostgreSQL, source of truth).
 // lbRepo maintains and reads the leaderboard projection (Redis Sorted Set).
 // userRepo resolves user IDs to display names in one batch query.
-func NewScoreService(repo repository.ScoreRepository, lbRepo repository.LeaderboardRepository, userRepo repository.UserRepository) *ScoreService {
-	return &ScoreService{repo: repo, lbRepo: lbRepo, userRepo: userRepo}
+// publisher emits score.submitted events to Kafka (one writer per app,
+// created in main and injected here — never per request, never a global).
+func NewScoreService(repo repository.ScoreRepository, lbRepo repository.LeaderboardRepository, userRepo repository.UserRepository, pub *publisher.EventPublisher) *ScoreService {
+	return &ScoreService{repo: repo, lbRepo: lbRepo, userRepo: userRepo, publisher: pub}
 }
 
 // LeaderboardRow is one display-ready leaderboard row.
@@ -47,9 +53,10 @@ type LeaderboardRow struct {
 //   - every submission creates a new row (history preserved)
 //
 // Persistence order: PostgreSQL first (source of truth), then Redis
-// (derived leaderboard, ZADD ... GT so a lower score never reduces the best).
-// A Redis failure is only logged — the submission still succeeds because the
-// score is durably stored in PostgreSQL.
+// (derived leaderboard, ZADD ... GT so a lower score never reduces the best),
+// then Kafka (score.submitted event). Redis and Kafka failures are only
+// logged — the submission still succeeds because the score is durably
+// stored in PostgreSQL.
 //
 // The userID comes from the verified JWT context — never from the request body.
 func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
@@ -58,8 +65,9 @@ func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
 		return 0, ErrInvalidScore
 	}
 
-	// Step 1: PostgreSQL — durable history. Failure here fails the submission.
-	scoreID, err := s.repo.InsertScore(userID, score)
+	// Step 1: PostgreSQL — durable history. Failure here fails the submission
+	// and prevents both Redis and Kafka from running.
+	scoreID, createdAt, err := s.repo.InsertScore(userID, score)
 	if err != nil {
 		return 0, errors.New("database error while saving score")
 	}
@@ -70,6 +78,28 @@ func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
 	// is rebuildable and will self-heal on the next higher score.
 	if err := s.lbRepo.UpdateBestScore(userID, score); err != nil {
 		log.Printf("warning: failed to update leaderboard for user %d score %d: %v", userID, score, err)
+	}
+
+	// Step 3: Kafka — score.submitted event, strictly AFTER PostgreSQL
+	// succeeded, because the event's score_id and created_at come from the
+	// INSERT ... RETURNING result. This is a submission event: it is
+	// published for every accepted submission, including scores that are
+	// not a new best.
+	//
+	// Soft-fail policy: a Kafka outage must never roll back the PostgreSQL
+	// row nor turn a successful submission into an HTTP error. The score is
+	// already durable; the event is best-effort here (no outbox in scope).
+	event := publisher.ScoreSubmittedEvent{
+		Event:     "score.submitted",
+		UserID:    userID,
+		Score:     score,
+		ScoreID:   scoreID,
+		CreatedAt: createdAt.Format(time.RFC3339),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.publisher.PublishScoreSubmitted(ctx, event); err != nil {
+		log.Printf("warning: failed to publish score.submitted for user %d score %d: %v", userID, score, err)
 	}
 
 	return scoreID, nil
