@@ -11,7 +11,13 @@
 //   - malformed events follow skip-and-commit (never applied, offset
 //     committed so the partition keeps moving);
 //   - reprocessing the same event re-sends the identical absolute score
-//     (set semantics — no increments or accumulated deltas in this layer).
+//     (set semantics — no increments or accumulated deltas in this layer);
+//   - offset commit failures retry in place (same event, no reprocessing)
+//     up to commitMaxAttempts; exhausting them STOPS the consumer, because
+//     Kafka commits are per-partition monotonic — acking a later offset
+//     would implicitly commit the unresolved event and lose it. The fake
+//     models this with per-partition committed positions (ack at offset N
+//     advances the position to N+1, covering all lower offsets).
 //
 // What these tests do NOT prove:
 //   - Redis server-side ZADD GT behavior. The fake mirrors the
@@ -23,6 +29,7 @@
 package consumer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -31,6 +38,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -152,17 +160,33 @@ func (f *fakeUpdater) bestOf(userID int) int {
 // fakeReader stands in for *kafka.Reader. Messages are served from an
 // in-memory queue; when the queue is empty FetchMessage blocks until ctx
 // is cancelled (mirroring a real reader waiting for the next record).
+//
+// Offset model: Kafka commits are per-partition monotonic — committing
+// offset N durably stores N+1 as the partition's next position and
+// implicitly covers every lower offset in that partition. positions
+// mirrors that: a successful CommitMessages advances positions[partition]
+// to max(current, offset+1). Attempts (including rejected ones) are
+// recorded separately so tests can count retries; only acked calls move
+// the committed position.
+//
+// CommitMessages failures are scripted with commitFailFirst: the first N
+// calls return an error (coordinator rejected the offset), later calls
+// succeed.
 type fakeReader struct {
-	mu      sync.Mutex
-	log     *seqLog
-	queue   []kafka.Message
-	fetched int
-	commits []kafka.Message
-	closes  int
+	mu              sync.Mutex
+	log             *seqLog
+	queue           []kafka.Message
+	fetched         int
+	commitCalls     int
+	commitFailFirst int
+	attempts        []kafka.Message
+	positions       map[int]int64 // partition -> next committed offset (offset+1 of last ack)
+	acks            int           // CommitMessages calls that returned nil
+	closes          int
 }
 
 func newFakeReader(lg *seqLog, msgs ...kafka.Message) *fakeReader {
-	return &fakeReader{log: lg, queue: msgs}
+	return &fakeReader{log: lg, queue: msgs, positions: make(map[int]int64)}
 }
 
 func (r *fakeReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
@@ -182,11 +206,27 @@ func (r *fakeReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
 
 func (r *fakeReader) CommitMessages(ctx context.Context, msgs ...kafka.Message) error {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.commitCalls++
+	fail := r.commitCalls <= r.commitFailFirst
 	for _, m := range msgs {
-		r.commits = append(r.commits, m)
+		r.attempts = append(r.attempts, m)
+		if fail {
+			r.log.add("commit-fail partition=%d offset=%d", m.Partition, m.Offset)
+			continue
+		}
+		// Acked: advance the partition's committed position to offset+1.
+		// Monotonic — a higher ack covers all lower offsets in the
+		// partition, exactly like the broker.
+		if next := m.Offset + 1; next > r.positions[m.Partition] {
+			r.positions[m.Partition] = next
+		}
+		r.acks++
 		r.log.add("commit partition=%d offset=%d", m.Partition, m.Offset)
 	}
-	r.mu.Unlock()
+	if fail {
+		return errors.New("broker coordinator unavailable")
+	}
 	return nil
 }
 
@@ -197,12 +237,46 @@ func (r *fakeReader) Close() error {
 	return nil
 }
 
-func (r *fakeReader) commitSnapshot() []kafka.Message {
+// commitAckCount returns how many CommitMessages calls were acknowledged
+// (returned nil). Acks count attempts that the broker accepted; for
+// message-loss questions the per-partition position matters, see
+// committedPosition.
+func (r *fakeReader) commitAckCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]kafka.Message, len(r.commits))
-	copy(out, r.commits)
+	return r.acks
+}
+
+// committedPosition returns the partition's committed position: the next
+// offset the broker would deliver after a restart. kafka.FirstOffset (-1)
+// means nothing has ever been acked for the partition.
+func (r *fakeReader) committedPosition(partition int) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if pos, ok := r.positions[partition]; ok {
+		return pos
+	}
+	return kafka.FirstOffset
+}
+
+// attemptSnapshot returns every CommitMessages call in order, whether it
+// was acked or rejected.
+func (r *fakeReader) attemptSnapshot() []kafka.Message {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]kafka.Message, len(r.attempts))
+	copy(out, r.attempts)
 	return out
+}
+
+func attemptsFor(msgs []kafka.Message, offset int64) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Offset == offset {
+			n++
+		}
+	}
+	return n
 }
 
 func (r *fakeReader) fetchCount() int {
@@ -284,7 +358,7 @@ func TestRun_ValidEvent_AppliesBeforeCommit(t *testing.T) {
 	rd := newFakeReader(lg, scoreEvent(t, 32, 9500, 7))
 	c := &ScoreConsumer{reader: rd, lbRepo: up}
 
-	runConsumerUntil(t, c, func() bool { return len(rd.commitSnapshot()) == 1 })
+	runConsumerUntil(t, c, func() bool { return rd.committedPosition(0) == 8 })
 
 	// Exact sequence: the projection was updated first, the offset
 	// committed second — never the other way around.
@@ -299,9 +373,12 @@ func TestRun_ValidEvent_AppliesBeforeCommit(t *testing.T) {
 	if args := up.argSnapshot(); len(args) != 1 || args[0] != [2]int{32, 9500} {
 		t.Fatalf("updater calls = %v, want exactly [[32 9500]]", args)
 	}
-	if commits := rd.commitSnapshot(); len(commits) != 1 ||
-		commits[0].Partition != 0 || commits[0].Offset != 7 {
-		t.Fatalf("commits = %+v, want exactly one for partition 0 offset 7", commits)
+	// One acked commit advancing partition 0's position to offset+1 = 8.
+	if pos := rd.committedPosition(0); pos != 8 {
+		t.Fatalf("committed position partition 0 = %d, want 8 (offset 7 + 1)", pos)
+	}
+	if rd.commitAckCount() != 1 {
+		t.Fatalf("commit acks = %d, want 1", rd.commitAckCount())
 	}
 	if rd.closeCount() != 1 {
 		t.Fatalf("reader Close called %d times on shutdown, want 1", rd.closeCount())
@@ -320,7 +397,7 @@ func TestRun_TransientFailure_RetriesWithoutCommit(t *testing.T) {
 	c := &ScoreConsumer{reader: rd, lbRepo: up}
 
 	start := time.Now()
-	runConsumerUntil(t, c, func() bool { return len(rd.commitSnapshot()) == 1 })
+	runConsumerUntil(t, c, func() bool { return rd.committedPosition(0) == 4 })
 	elapsed := time.Since(start)
 
 	// Exact sequence: no commit may appear between the failed attempts
@@ -370,17 +447,20 @@ func TestRun_TransientFailure_ShutdownLeavesEventUncommitted(t *testing.T) {
 		t.Fatal("Run did not stop after context cancel during retry")
 	}
 
-	if n := len(rd.commitSnapshot()); n != 0 {
+	if n := rd.commitAckCount(); n != 0 {
 		t.Fatalf("committed %d offsets while the update was failing, want 0", n)
 	}
 	if n := up.callCount(); n != 1 {
 		t.Fatalf("updater attempts = %d, want 1 (cancelled during first backoff)", n)
 	}
-	// Fetched once, committed zero times: the event was in flight when the
+	// Fetched once, zero commit attempts: the event was in flight when the
 	// loop shut down, so the broker still owns it and will redeliver it to
 	// the next generation — the at-least-once redelivery state.
-	if fetched, committed := rd.fetchCount(), len(rd.commitSnapshot()); fetched != 1 || committed != 0 {
-		t.Fatalf("fetched=%d commits=%d, want fetched=1 commits=0 (uncommitted => redeliverable)", fetched, committed)
+	if fetched, acks := rd.fetchCount(), rd.commitAckCount(); fetched != 1 || acks != 0 {
+		t.Fatalf("fetched=%d acks=%d, want fetched=1 acks=0 (uncommitted => redeliverable)", fetched, acks)
+	}
+	if pos := rd.committedPosition(0); pos != kafka.FirstOffset {
+		t.Fatalf("committed position partition 0 = %d, want FirstOffset (nothing acked)", pos)
 	}
 }
 
@@ -403,7 +483,7 @@ func TestRun_MalformedEvents_SkipAndCommit(t *testing.T) {
 	rd := newFakeReader(lg, badJSON, negativeScore, zeroUser, good)
 	c := &ScoreConsumer{reader: rd, lbRepo: up}
 
-	runConsumerUntil(t, c, func() bool { return len(rd.commitSnapshot()) == 4 })
+	runConsumerUntil(t, c, func() bool { return rd.committedPosition(0) == 8 }) // last of 4,5,6,7 is offset 7 -> pos 8
 
 	// Exact sequence: each malformed event is committed (skipped) without
 	// ever reaching the projection; the valid event still applies normally,
@@ -439,7 +519,7 @@ func TestRun_DuplicateEvent_ReappliesSameAbsoluteScore(t *testing.T) {
 	rd := newFakeReader(lg, ev, ev)
 	c := &ScoreConsumer{reader: rd, lbRepo: up}
 
-	runConsumerUntil(t, c, func() bool { return len(rd.commitSnapshot()) == 2 })
+	runConsumerUntil(t, c, func() bool { return rd.commitAckCount() == 2 })
 
 	// Both passes send the identical ABSOLUTE score: this layer never
 	// increments, accumulates, or derives deltas, so a store honoring
@@ -453,7 +533,9 @@ func TestRun_DuplicateEvent_ReappliesSameAbsoluteScore(t *testing.T) {
 	}
 
 	// Each delivery was applied then committed; both commits target the
-	// same partition/offset, which is harmless for the coordinator.
+	// same partition/offset. The committed position advances to 13 on the
+	// first ack and stays there — re-committing the same offset is a no-op
+	// for the monotonic position.
 	want := []string{
 		"update-ok user=32 score=9500",
 		"commit partition=0 offset=12",
@@ -463,8 +545,181 @@ func TestRun_DuplicateEvent_ReappliesSameAbsoluteScore(t *testing.T) {
 	if got := lg.snapshot(); !sameSequence(got, want) {
 		t.Fatalf("sequence mismatch:\n got: %v\nwant: %v", got, want)
 	}
-	commits := rd.commitSnapshot()
-	if len(commits) != 2 || commits[0].Offset != commits[1].Offset {
-		t.Fatalf("commits = %+v, want two commits of the same offset", commits)
+	if pos := rd.committedPosition(0); pos != 13 {
+		t.Fatalf("committed position partition 0 = %d, want 13 (offset 12 + 1, monotonic)", pos)
+	}
+	if n := rd.commitAckCount(); n != 2 {
+		t.Fatalf("commit acks = %d, want 2", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// commit-failure policy: bounded retries around the offset commit itself
+// ---------------------------------------------------------------------------
+
+// TestRun_CommitFailure_RetriesUntilAck_WithoutReprocessing covers the
+// commit()-retry loop when the coordinator rejects an offset temporarily:
+// the commit is retried in place, the event is NOT re-applied to the
+// projection (process happens once per fetch), and the offset counts as
+// committed only when CommitMessages finally returns nil.
+func TestRun_CommitFailure_RetriesUntilAck_WithoutReprocessing(t *testing.T) {
+	lg := &seqLog{}
+	up := newFakeUpdater(lg)
+	rd := newFakeReader(lg, scoreEvent(t, 32, 9500, 8))
+	rd.commitFailFirst = 2 // coordinator rejects attempts 1-2, acks attempt 3
+	c := &ScoreConsumer{reader: rd, lbRepo: up}
+
+	start := time.Now()
+	runConsumerUntil(t, c, func() bool { return rd.committedPosition(0) == 9 })
+	elapsed := time.Since(start)
+
+	// Exact sequence: one apply, then commit-fail, commit-fail, acked
+	// commit. The apply appears exactly ONCE — the commit attempts must
+	// not drag the event back through processing.
+	want := []string{
+		"update-ok user=32 score=9500",
+		"commit-fail partition=0 offset=8",
+		"commit-fail partition=0 offset=8",
+		"commit partition=0 offset=8",
+	}
+	if got := lg.snapshot(); !sameSequence(got, want) {
+		t.Fatalf("sequence mismatch:\n got: %v\nwant: %v", got, want)
+	}
+
+	// Attempt vs ack distinction: 3 attempts, exactly 1 ack, and the ack
+	// advanced the partition position to offset+1 = 9.
+	if n := len(rd.attemptSnapshot()); n != 3 {
+		t.Fatalf("commit attempts = %d, want 3 (2 rejections + 1 ack)", n)
+	}
+	if n := rd.commitAckCount(); n != 1 {
+		t.Fatalf("commit acks = %d, want exactly 1 ack of offset 8", n)
+	}
+	if pos := rd.committedPosition(0); pos != 9 {
+		t.Fatalf("committed position partition 0 = %d, want 9 (offset 8 + 1)", pos)
+	}
+
+	// No unnecessary reprocessing within the same processing attempt:
+	// the updater ran exactly once with the original absolute score.
+	if n := up.callCount(); n != 1 {
+		t.Fatalf("updater calls = %d, want 1 (commit retries must not re-apply)", n)
+	}
+	if args := up.argSnapshot(); len(args) != 1 || args[0] != [2]int{32, 9500} {
+		t.Fatalf("updater args = %v, want exactly [[32 9500]] (absolute score, once)", args)
+	}
+	// Absolute best-score semantics: state equals the event score exactly —
+	// a failed commit neither increments nor re-applies it.
+	if v := up.bestOf(32); v != 9500 {
+		t.Fatalf("best score = %d, want exactly 9500 (absolute set, no increment)", v)
+	}
+
+	// The design's backoff slept 500ms after each of the two rejections.
+	if elapsed < 1*time.Second {
+		t.Fatalf("elapsed %s before ack, want >= 1s (two 500ms backoff sleeps)", elapsed)
+	}
+}
+
+// TestRun_CommitFailure_ExhaustionStops_NoImplicitOffsetAdvance is the
+// regression test for per-partition monotonic commit semantics: Kafka
+// committing offset N implicitly commits every lower offset in that
+// partition. If offset 10 exhausts its commit attempts, the consumer must
+// STOP — continuing to offset 11 and acking it would silently mark offset
+// 10 committed too, losing the message after a restart.
+//
+// The fake models this: an acked commit advances the partition's position
+// to offset+1; committedPosition stays at FirstOffset only if nothing was
+// ever acked for that partition.
+func TestRun_CommitFailure_ExhaustionStops_NoImplicitOffsetAdvance(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(io.Discard) // restore TestMain's discard after this test
+
+	lg := &seqLog{}
+	up := newFakeUpdater(lg)
+	// Two events in the SAME partition. Offset 10's commit is rejected on
+	// all 5 attempts; offset 11 must never be fetched or committed.
+	rd := newFakeReader(lg, scoreEvent(t, 32, 9500, 10), scoreEvent(t, 31, 4000, 11))
+	rd.commitFailFirst = 5
+	c := &ScoreConsumer{reader: rd, lbRepo: up}
+
+	start := time.Now()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		c.Run(ctx)
+		close(done)
+	}()
+	// Run must stop on its own after the give-up (not hang, not continue).
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not stop after exhausting commit attempts")
+	}
+	elapsed := time.Since(start)
+
+	// Exact sequence: msg1 applied, rejected exactly 5 times, then the
+	// loop stops. There is NO entry for msg2 — it was never fetched.
+	want := []string{
+		"update-ok user=32 score=9500",
+		"commit-fail partition=0 offset=10",
+		"commit-fail partition=0 offset=10",
+		"commit-fail partition=0 offset=10",
+		"commit-fail partition=0 offset=10",
+		"commit-fail partition=0 offset=10",
+	}
+	if got := lg.snapshot(); !sameSequence(got, want) {
+		t.Fatalf("sequence mismatch:\n got: %v\nwant: %v", got, want)
+	}
+
+	// Exactly commitMaxAttempts (5) attempts for offset 10...
+	all := rd.attemptSnapshot()
+	if n := attemptsFor(all, 10); n != 5 {
+		t.Fatalf("commit attempts for offset 10 = %d, want exactly 5 (commitMaxAttempts)", n)
+	}
+	if n := attemptsFor(all, 11); n != 0 {
+		t.Fatalf("commit attempts for offset 11 = %d, want 0 (later offset must not be committed)", n)
+	}
+	// ...ZERO acks, and the partition position never advanced: a restart
+	// would redeliver offset 10 (at-least-once preserved, no message loss).
+	// Under the pre-fix behavior this position would have been 12,
+	// silently covering the unresolved offset 10.
+	if n := rd.commitAckCount(); n != 0 {
+		t.Fatalf("commit acks = %d, want 0 (no false ack)", n)
+	}
+	if pos := rd.committedPosition(0); pos != kafka.FirstOffset {
+		t.Fatalf("committed position partition 0 = %d, want FirstOffset (%d) — "+
+			"a later offset must never advance the position past an unresolved event",
+			pos, kafka.FirstOffset)
+	}
+	if n := rd.fetchCount(); n != 1 {
+		t.Fatalf("messages fetched = %d, want 1 (loop must stop, not fetch offset 11)", n)
+	}
+
+	// The give-up is reported honestly: one warning per attempt plus the
+	// explicit stop message — never a success claim for offset 10.
+	out := logs.String()
+	if n := strings.Count(out, "offset commit failed"); n != 5 {
+		t.Fatalf("commit-failure warnings = %d, want 5; logs:\n%s", n, out)
+	}
+	if !strings.Contains(out, "offset commit not acknowledged after 5 attempts") ||
+		!strings.Contains(out, "stopping consumer to avoid committing a later offset") {
+		t.Fatalf("missing explicit stop-on-exhaustion log; logs:\n%s", out)
+	}
+
+	// No reprocessing and no increment: the applied event was applied
+	// exactly once with its original absolute score.
+	if n := up.callCount(); n != 1 {
+		t.Fatalf("updater calls = %d, want 1", n)
+	}
+	if args := up.argSnapshot(); len(args) != 1 || args[0] != [2]int{32, 9500} {
+		t.Fatalf("updater args = %v, want exactly [[32 9500]]", args)
+	}
+	if v := up.bestOf(32); v != 9500 {
+		t.Fatalf("best score = %d, want exactly 9500 (absolute set, no increment)", v)
+	}
+
+	// Five backoff sleeps (500ms after each rejection) precede the stop.
+	if elapsed < 2500*time.Millisecond {
+		t.Fatalf("elapsed %s before stop, want >= 2.5s (5 x 500ms backoff)", elapsed)
 	}
 }

@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -19,6 +23,10 @@ import (
 	"real_time_leaderboard/internal/repository"
 	"real_time_leaderboard/internal/service"
 )
+
+// httpShutdownTimeout bounds the graceful HTTP shutdown so cleanup can
+// never hang indefinitely on a stuck request.
+const httpShutdownTimeout = 10 * time.Second
 
 // Application holds the shared application state, including the database connection pool.
 type Application struct {
@@ -107,7 +115,83 @@ type HealthResponse struct {
 	Status string `json:"status"`
 }
 
-func main() {
+// shutdownReason states why the application is stopping.
+type shutdownReason int
+
+const (
+	// reasonSignal: a termination signal (Ctrl+C / SIGTERM) was received —
+	// the normal graceful-shutdown path.
+	reasonSignal shutdownReason = iota
+	// reasonCancelled: the consumer context was already cancelled when the
+	// consumer goroutine exited — also normal (shutdown in progress).
+	reasonCancelled
+	// reasonServerExit: the HTTP server stopped serving on its own.
+	reasonServerExit
+	// reasonConsumerExit: the consume loop exited while the application
+	// context was still active — an unexpected, fatal condition.
+	reasonConsumerExit
+)
+
+// errConsumerExited marks the fatal case: the consume loop stopped
+// without the application context having been cancelled.
+var errConsumerExited = errors.New("leaderboard consumer exited unexpectedly")
+
+// awaitShutdown blocks until the first shutdown trigger fires and reports
+// which one it was:
+//
+//   - sig: a termination signal (reasonSignal);
+//   - serverErr: the HTTP server's serve loop returned (reasonServerExit,
+//     carrying the server error, if any);
+//   - consumerWatch: the consumer goroutine exited (closed its done
+//     channel). If ctx is still active this is the FATAL case
+//     (reasonConsumerExit): the consumer stopped on its own — e.g. after
+//     exhausting its offset-commit retries — and the API must not keep
+//     accepting scores nobody will consume. If ctx was already cancelled,
+//     the exit is the expected result of shutdown (reasonCancelled).
+//
+// consumerWatch must be a nil channel when no consumer runs, so that case
+// can never fire.
+func awaitShutdown(ctx context.Context, sig <-chan os.Signal, serverErr <-chan error, consumerWatch <-chan struct{}) (shutdownReason, error) {
+	select {
+	case <-sig:
+		return reasonSignal, nil
+	case err := <-serverErr:
+		return reasonServerExit, err
+	case <-consumerWatch:
+		if ctx.Err() != nil {
+			return reasonCancelled, nil
+		}
+		return reasonConsumerExit, errConsumerExited
+	}
+}
+
+// cleanupRuntime gracefully stops the HTTP server FIRST — within timeout
+// (callers pass httpShutdownTimeout) — and only then stops the consumer
+// loop. This order matters: the consumer-group shutdown can take tens of
+// seconds (kafka-go waits out the group session timeout on Close), so
+// HTTP must reject new requests before that wait begins; otherwise the
+// API would keep accepting score submissions that nothing is consuming.
+// The consumer stop is invoked even when the HTTP shutdown times out or
+// fails, so remaining cleanup never gets skipped. Returns the HTTP
+// shutdown error, if any.
+func cleanupRuntime(srv *http.Server, stopConsumer func(), timeout time.Duration) error {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), timeout)
+	defer shutdownCancel()
+	shutdownErr := srv.Shutdown(shutdownCtx)
+	stopConsumer()
+	return shutdownErr
+}
+
+// run initializes the application, serves HTTP, and supervises the
+// consumer goroutine until a shutdown trigger fires. It always runs the
+// full cleanup sequence — gracefully stop the HTTP server first (stop
+// accepting new requests, drain in-flight ones), stop the consumer
+// (cancel + wait), then close the database pool, Redis client, and Kafka
+// writer — and then returns the process exit code. main() exits with that
+// code, so a fatal consumer exit surfaces as a non-zero status for the
+// process supervisor. No log.Fatal is used after initialization: errors
+// propagate as exit codes so deferred cleanup always completes first.
+func run() int {
 	// Initialize the application with database connectivity and handler.
 	// If db.InitDB() fails (e.g., PostgreSQL unreachable), the program exits
 	// before the HTTP server starts, preventing an unhealthy server from serving traffic.
@@ -122,6 +206,7 @@ func main() {
 	// context cancellation: cancel() unblocks FetchMessage, Run returns and
 	// closes the reader (final commit attempt + leaving the group).
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	consumerDone := make(chan struct{})
 	if app.ScoreConsumer != nil {
 		go func() {
@@ -134,6 +219,10 @@ func main() {
 	}
 
 	port := "8080"
+	srv := &http.Server{Addr: ":" + port, Handler: mux}
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- srv.ListenAndServe() }()
+
 	fmt.Printf("Server starting on http://localhost:%s\n", port)
 	fmt.Printf("Health endpoint: GET /health\n")
 	fmt.Printf("Register endpoint: POST /register\n")
@@ -142,17 +231,69 @@ func main() {
 	fmt.Printf("Leaderboard endpoint: GET /leaderboard\n")
 	fmt.Printf("Leaderboard consumer: group leaderboard-writer (disable with CONSUMER_ENABLED=false)\n")
 
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
-		log.Fatalf("Error starting HTTP server: %v", err)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	// A nil consumerWatch blocks forever — with the consumer disabled there
+	// is no consume loop whose exit could be fatal.
+	var consumerWatch <-chan struct{}
+	if app.ScoreConsumer != nil {
+		consumerWatch = consumerDone
 	}
 
-	// The HTTP server has stopped (e.g., via Ctrl+C).
-	// Stop the consumer loop first (context cancellation), wait for it to
-	// close the reader and leave the group, then close the database pool,
-	// Redis client, and Kafka writer.
-	cancel()
-	<-consumerDone
+	reason, cause := awaitShutdown(ctx, sigCh, serverErr, consumerWatch)
+
+	exitCode := 0
+	switch reason {
+	case reasonSignal:
+		log.Println("shutdown: termination signal received")
+	case reasonCancelled:
+		log.Println("shutdown: consumer stopped after context cancellation")
+	case reasonServerExit:
+		if cause != nil && !errors.Is(cause, http.ErrServerClosed) {
+			log.Printf("fatal: HTTP server stopped unexpectedly: %v", cause)
+			exitCode = 1
+		} else {
+			log.Println("shutdown: HTTP server stopped")
+		}
+	case reasonConsumerExit:
+		// Unexpected: the consume loop exited while ctx was still active
+		// (e.g. offset-commit retries exhausted). The API must stop
+		// accepting traffic — otherwise it would publish events nobody
+		// consumes — and the process must exit non-zero so a supervisor
+		// restarts it. Never log.Fatal here: cleanup below must run first.
+		log.Printf("fatal: leaderboard consumer exited unexpectedly while the application context is still active "+
+			"(%v); stopping the HTTP API so no further scores are accepted without a consumer; "+
+			"process supervisor should restart the application", cause)
+		exitCode = 1
+	}
+
+	// Unified cleanup for BOTH normal and fatal paths: stop HTTP FIRST
+	// (stops accepting new requests, drains in-flight ones within the
+	// timeout), then stop the consumer loop (context cancellation + wait
+	// for reader close / group leave — can take ~20s), then close the
+	// stores.
+	shutdownErr := cleanupRuntime(srv, func() {
+		cancel()
+		<-consumerDone
+	}, httpShutdownTimeout)
+	<-serverErr // wait for ListenAndServe to return (http.ErrServerClosed)
+
+	if shutdownErr != nil {
+		log.Printf("warning: HTTP server graceful shutdown failed: %v", shutdownErr)
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
+
 	db.CloseDB(app.DB)
 	db.CloseRedis(app.Redis)
 	app.Publisher.Close()
+	log.Println("shutdown complete")
+	return exitCode
+}
+
+func main() {
+	os.Exit(run())
 }

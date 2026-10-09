@@ -116,6 +116,10 @@ func DefaultReaderConfig() kafka.ReaderConfig {
 //     it stays eligible for redelivery (at-least-once, self-healing).
 //   - permanent (malformed/invalid): logged with the raw payload and
 //     committed, so the partition keeps moving.
+//   - unrecoverable offset commit: after bounded commit retries the
+//     consumer STOPS instead of continuing (see commit). Kafka commits
+//     are per-partition monotonic — a later commit would implicitly
+//     commit this unresolved event and lose it after a restart.
 //
 // Shutdown: ctx cancellation unblocks FetchMessage; the deferred reader
 // Close performs a final commit attempt and leaves the group. Any message
@@ -144,7 +148,9 @@ func (c *ScoreConsumer) Run(ctx context.Context) {
 			return // context cancelled while pending — no commit, redelivery
 		}
 		if !c.commit(ctx, msg) {
-			return // context cancelled while committing — redelivery
+			return // shutdown or unrecoverable commit failure — stop; no
+			// later offset in this partition is committed, so the event
+			// stays eligible for redelivery (at-least-once).
 		}
 	}
 }
@@ -202,11 +208,25 @@ func (c *ScoreConsumer) process(msg kafka.Message) error {
 }
 
 // commit durably records the processed offset (stores msg.Offset+1 via the
-// group coordinator). Sync commits are retried briefly; if the broker never
-// acknowledges within commitMaxAttempts, we move on: the event WAS
-// processed, a later successful commit for this partition supersedes it,
-// and if we crash now the event is simply redelivered and re-applied
-// idempotently. Returns false only when ctx is cancelled.
+// group coordinator). Sync commits are retried briefly with the standard
+// backoff; if the broker never acknowledges within commitMaxAttempts the
+// consumer STOPS (returns false) rather than moving on.
+//
+// Why stop: Kafka offset commits are per-partition monotonic — committing
+// offset N+1 implicitly commits every offset below it in that partition.
+// Continuing to the next message and successfully committing ITS offset
+// would silently mark this unresolved event committed too, and a restart
+// would skip it forever (message loss). Stopping leaves the event
+// uncommitted: on restart the group resumes from the last durably
+// committed offset and redelivers it, preserving at-least-once delivery.
+//
+// Operational consequence: an unrecoverable commit failure (coordinator
+// unreachable for the whole retry budget) is not self-healing — the
+// consume loop exits and the process must be restarted to resume. The
+// failure is logged loudly; it is never reported as a successful commit.
+//
+// Returns false on ctx cancellation OR unrecoverable commit failure —
+// both leave the message uncommitted and the loop stopped.
 func (c *ScoreConsumer) commit(ctx context.Context, msg kafka.Message) bool {
 	for attempt := 1; attempt <= commitMaxAttempts; attempt++ {
 		if err := c.reader.CommitMessages(ctx, msg); err != nil {
@@ -222,9 +242,11 @@ func (c *ScoreConsumer) commit(ctx context.Context, msg kafka.Message) bool {
 		}
 		return true
 	}
-	log.Printf("error: offset commit not acknowledged after %d attempts (partition=%d offset=%d); relying on redelivery/superseding commit",
+	log.Printf("error: offset commit not acknowledged after %d attempts (partition=%d offset=%d); "+
+		"stopping consumer to avoid committing a later offset that would implicitly commit this one "+
+		"(Kafka commits are per-partition monotonic); restart to redeliver from the last committed offset",
 		commitMaxAttempts, msg.Partition, msg.Offset)
-	return true
+	return false
 }
 
 // sleep waits for d and returns false if ctx was cancelled first.
