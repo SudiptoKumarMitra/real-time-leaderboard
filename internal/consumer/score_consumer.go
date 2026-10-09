@@ -41,11 +41,34 @@ const (
 // projection can be rebuilt from it at any time.
 var errPermanent = errors.New("permanent event error")
 
+// messageReader is the consume loop's view of the Kafka reader: fetch one
+// message, commit one message, close. *kafka.Reader satisfies it in
+// production; unit tests substitute an in-memory fake so the loop's
+// process-then-commit ordering can be verified without a broker.
+type messageReader interface {
+	FetchMessage(ctx context.Context) (kafka.Message, error)
+	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
+// bestScoreUpdater is the consume loop's view of the leaderboard
+// projection: the single ZADD ... GT operation, named after the operation
+// rather than the store. *repository.LeaderboardRepository satisfies it in
+// production; unit tests substitute a fake so no Redis server is needed.
+type bestScoreUpdater interface {
+	UpdateBestScore(userID int, score int) error
+}
+
 // ScoreConsumer consumes score.submitted events and updates the Redis
 // leaderboard projection with ZADD ... GT.
+//
+// Both dependencies are the narrow interfaces above: production wiring is
+// unchanged (the constructor still builds one *kafka.Reader and accepts
+// *repository.LeaderboardRepository), while tests can drive the loop with
+// fakes.
 type ScoreConsumer struct {
-	reader *kafka.Reader
-	lbRepo *repository.LeaderboardRepository
+	reader messageReader
+	lbRepo bestScoreUpdater
 }
 
 // NewScoreConsumer creates the application's single Kafka consumer.
