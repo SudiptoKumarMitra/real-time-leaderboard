@@ -52,11 +52,12 @@ type LeaderboardRow struct {
 //   - score 0 is accepted
 //   - every submission creates a new row (history preserved)
 //
-// Persistence order: PostgreSQL first (source of truth), then Redis
-// (derived leaderboard, ZADD ... GT so a lower score never reduces the best),
-// then Kafka (score.submitted event). Redis and Kafka failures are only
-// logged — the submission still succeeds because the score is durably
-// stored in PostgreSQL.
+// Persistence order: PostgreSQL first (source of truth), then the
+// Kafka score.submitted event. The Redis leaderboard is NOT written here —
+// it is updated only by the Kafka consumer, which applies the event
+// asynchronously. PostgreSQL and Kafka failure policies are unchanged:
+// a PostgreSQL failure fails the submission, a Kafka failure is only
+// logged because the score is durably stored in PostgreSQL.
 //
 // The userID comes from the verified JWT context — never from the request body.
 func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
@@ -66,21 +67,13 @@ func (s *ScoreService) SubmitScore(userID, score int) (int, error) {
 	}
 
 	// Step 1: PostgreSQL — durable history. Failure here fails the submission
-	// and prevents both Redis and Kafka from running.
+	// and prevents Kafka from running.
 	scoreID, createdAt, err := s.repo.InsertScore(userID, score)
 	if err != nil {
 		return 0, errors.New("database error while saving score")
 	}
 
-	// Step 2: Redis — leaderboard projection (best score only).
-	// Runs strictly after a successful INSERT so Redis never claims a score
-	// that PostgreSQL does not have. Failure is non-fatal: the projection
-	// is rebuildable and will self-heal on the next higher score.
-	if err := s.lbRepo.UpdateBestScore(userID, score); err != nil {
-		log.Printf("warning: failed to update leaderboard for user %d score %d: %v", userID, score, err)
-	}
-
-	// Step 3: Kafka — score.submitted event, strictly AFTER PostgreSQL
+	// Step 2: Kafka — score.submitted event, strictly AFTER PostgreSQL
 	// succeeded, because the event's score_id and created_at come from the
 	// INSERT ... RETURNING result. This is a submission event: it is
 	// published for every accepted submission, including scores that are
