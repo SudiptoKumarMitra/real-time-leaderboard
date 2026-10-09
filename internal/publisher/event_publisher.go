@@ -11,18 +11,14 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/segmentio/kafka-go"
-)
 
-// scoreSubmittedTopic is the topic that score submission events are
-// published to. The topic already exists (2 partitions) — this component
-// only produces to it, it never creates it.
-const scoreSubmittedTopic = "score.submitted"
+	"real_time_leaderboard/internal/config"
+)
 
 // ScoreSubmittedEvent is the payload published after a score row has been
 // committed to PostgreSQL.
@@ -45,7 +41,8 @@ type EventPublisher struct {
 
 // NewEventPublisher creates the application's single Kafka publisher.
 //
-// Brokers come from KAFKA_BROKERS (comma-separated, default localhost:9092).
+// Brokers come from config.Brokers() (KAFKA_BROKERS, comma-separated,
+// default localhost:9092); the topic from config.ScoreSubmittedTopic.
 // A bounded metadata request verifies broker and topic reachability at
 // startup, matching the fail-fast behavior of db.InitDB and db.InitRedis:
 // a wrong address kills the process before it accepts traffic instead of
@@ -59,11 +56,11 @@ type EventPublisher struct {
 //   - Balancer Hash: partition = hash(key) % 2, so every event for one user
 //     reaches the same partition and stays ordered
 func NewEventPublisher() *EventPublisher {
-	brokers := brokerAddrs()
+	brokers := config.Brokers()
 
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
-		Topic:        scoreSubmittedTopic,
+		Topic:        config.ScoreSubmittedTopic,
 		RequiredAcks: kafka.RequireAll,
 		WriteTimeout: 5 * time.Second,
 		BatchTimeout: 10 * time.Millisecond,
@@ -85,26 +82,26 @@ func verifyTopic(brokers []string) {
 	resp, err := (&kafka.Client{
 		Addr:    kafka.TCP(brokers...),
 		Timeout: 3 * time.Second,
-	}).Metadata(ctx, &kafka.MetadataRequest{Topics: []string{scoreSubmittedTopic}})
+	}).Metadata(ctx, &kafka.MetadataRequest{Topics: []string{config.ScoreSubmittedTopic}})
 	if err != nil {
 		log.Fatalf("failed to fetch kafka metadata from %s: %v", strings.Join(brokers, ","), err)
 	}
 
 	for _, t := range resp.Topics {
-		if t.Name != scoreSubmittedTopic {
+		if t.Name != config.ScoreSubmittedTopic {
 			continue
 		}
 		if t.Error != nil {
-			log.Fatalf("kafka topic %q metadata error: %v", scoreSubmittedTopic, t.Error)
+			log.Fatalf("kafka topic %q metadata error: %v", config.ScoreSubmittedTopic, t.Error)
 		}
 		if len(t.Partitions) == 0 {
-			log.Fatalf("kafka topic %q has no partitions", scoreSubmittedTopic)
+			log.Fatalf("kafka topic %q has no partitions", config.ScoreSubmittedTopic)
 		}
 		log.Printf("kafka producer ready (brokers=%s topic=%s partitions=%d)",
-			strings.Join(brokers, ","), scoreSubmittedTopic, len(t.Partitions))
+			strings.Join(brokers, ","), config.ScoreSubmittedTopic, len(t.Partitions))
 		return
 	}
-	log.Fatalf("kafka topic %q not found on broker(s) %s", scoreSubmittedTopic, strings.Join(brokers, ","))
+	log.Fatalf("kafka topic %q not found on broker(s) %s", config.ScoreSubmittedTopic, strings.Join(brokers, ","))
 }
 
 // PublishScoreSubmitted writes one score.submitted event and returns only
@@ -134,21 +131,4 @@ func (p *EventPublisher) PublishScoreSubmitted(ctx context.Context, event ScoreS
 func (p *EventPublisher) Close() {
 	p.writer.Close()
 	log.Println("kafka producer closed")
-}
-
-// brokerAddrs parses the comma-separated KAFKA_BROKERS environment
-// variable, defaulting to localhost:9092.
-func brokerAddrs() []string {
-	raw := os.Getenv("KAFKA_BROKERS")
-	if raw == "" {
-		raw = "localhost:9092"
-	}
-	parts := strings.Split(raw, ",")
-	addrs := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part = strings.TrimSpace(part); part != "" {
-			addrs = append(addrs, part)
-		}
-	}
-	return addrs
 }

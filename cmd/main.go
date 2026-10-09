@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/redis/go-redis/v9"
 
 	"real_time_leaderboard/db"
+	"real_time_leaderboard/internal/consumer"
 	"real_time_leaderboard/internal/handler"
 	"real_time_leaderboard/internal/middleware"
 	"real_time_leaderboard/internal/publisher"
@@ -22,10 +25,15 @@ type Application struct {
 	DB        *sql.DB
 	Redis     *redis.Client
 	Publisher *publisher.EventPublisher
-	Hnd       *handler.UserHandler
-	ScHnd     *handler.ScoreHandler
-	LbHnd     *handler.LeaderboardHandler
-	JWTSecret string
+	// ScoreConsumer is the leaderboard consumer (group leaderboard-writer).
+	// It is nil when disabled via CONSUMER_ENABLED=false: constructing a
+	// group reader joins the consumer group immediately, so the reader must
+	// only be built when this process will actually run the consume loop.
+	ScoreConsumer *consumer.ScoreConsumer
+	Hnd           *handler.UserHandler
+	ScHnd         *handler.ScoreHandler
+	LbHnd         *handler.LeaderboardHandler
+	JWTSecret     string
 }
 
 // NewApplication initializes the application with a database connection pool and handler.
@@ -42,18 +50,30 @@ func NewApplication() *Application {
 	scoreRepo := repository.NewScoreRepository(databasePool)
 	lbRepo := repository.NewLeaderboardRepository(redisClient)
 	eventPub := publisher.NewEventPublisher()
+
+	// Leaderboard consumer: created ONCE during application startup (one
+	// kafka.Reader for the whole process — never per message/request, no
+	// globals). It consumes score.submitted and applies ZADD GT to Redis,
+	// running alongside the API's direct Redis write during the migration's
+	// dual-write phase.
+	var scoreConsumer *consumer.ScoreConsumer
+	if os.Getenv("CONSUMER_ENABLED") != "false" {
+		scoreConsumer = consumer.NewScoreConsumer(consumer.DefaultReaderConfig(), lbRepo)
+	}
+
 	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo, *userRepo, eventPub)
 	scoreHnd := handler.NewScoreHandler(scoreSvc)
 	lbHnd := handler.NewLeaderboardHandler(scoreSvc)
 
 	return &Application{
-		DB:        databasePool,
-		Redis:     redisClient,
-		Publisher: eventPub,
-		Hnd:       userHnd,
-		ScHnd:     scoreHnd,
-		LbHnd:     lbHnd,
-		JWTSecret: jwtSecret,
+		DB:            databasePool,
+		Redis:         redisClient,
+		Publisher:     eventPub,
+		ScoreConsumer: scoreConsumer,
+		Hnd:           userHnd,
+		ScHnd:         scoreHnd,
+		LbHnd:         lbHnd,
+		JWTSecret:     jwtSecret,
 	}
 }
 
@@ -98,6 +118,21 @@ func main() {
 	mux := http.NewServeMux()
 	app.RegisterRoutes(mux)
 
+	// Start the leaderboard consumer in a goroutine. Shutdown is driven by
+	// context cancellation: cancel() unblocks FetchMessage, Run returns and
+	// closes the reader (final commit attempt + leaving the group).
+	ctx, cancel := context.WithCancel(context.Background())
+	consumerDone := make(chan struct{})
+	if app.ScoreConsumer != nil {
+		go func() {
+			defer close(consumerDone)
+			app.ScoreConsumer.Run(ctx)
+		}()
+	} else {
+		log.Println("leaderboard consumer disabled (CONSUMER_ENABLED=false)")
+		close(consumerDone)
+	}
+
 	port := "8080"
 	fmt.Printf("Server starting on http://localhost:%s\n", port)
 	fmt.Printf("Health endpoint: GET /health\n")
@@ -105,14 +140,18 @@ func main() {
 	fmt.Printf("Login endpoint: POST /login\n")
 	fmt.Printf("Score endpoint: POST /scores (authenticated)\n")
 	fmt.Printf("Leaderboard endpoint: GET /leaderboard\n")
+	fmt.Printf("Leaderboard consumer: group leaderboard-writer (disable with CONSUMER_ENABLED=false)\n")
 
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Error starting HTTP server: %v", err)
 	}
 
 	// The HTTP server has stopped (e.g., via Ctrl+C).
-	// Close the database pool, Redis client, and Kafka writer to clean up
-	// their pooled connections.
+	// Stop the consumer loop first (context cancellation), wait for it to
+	// close the reader and leave the group, then close the database pool,
+	// Redis client, and Kafka writer.
+	cancel()
+	<-consumerDone
 	db.CloseDB(app.DB)
 	db.CloseRedis(app.Redis)
 	app.Publisher.Close()
