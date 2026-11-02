@@ -1,0 +1,73 @@
+// Leaderboard query contract: the read-only surface served by the
+// leaderboard Query Service (cmd/query) and consumed by the HTTP API
+// (cmd/api) over gRPC.
+//
+// Field shapes mirror the existing HTTP/domain types:
+//   - scores are integers in [0, 1000000] (service maxScore)
+//   - user_id is a positive PostgreSQL user id
+//   - ranks are 1-based display ranks (Redis's 0-based ZREVRANK index
+//     never crosses this contract)
+syntax = "proto3";
+
+package leaderboard.v1;
+
+option go_package = "real_time_leaderboard/internal/gen/leaderboard/v1;leaderboardv1";
+
+// LeaderboardQuery serves leaderboard reads from the Redis projection
+// maintained by the worker. It is synchronous query traffic only — score
+// events keep flowing through Kafka; this service never writes.
+service LeaderboardQuery {
+  // GetLeaderboard returns the top `limit` players ordered by best score,
+  // descending. An empty leaderboard is a successful response with zero
+  // entries — never an error.
+  rpc GetLeaderboard(GetLeaderboardRequest) returns (GetLeaderboardResponse);
+
+  // GetUserRank returns one user's current position. An unranked user is
+  // a successful response with ranked=false (see GetUserRankResponse) —
+  // never an error.
+  rpc GetUserRank(GetUserRankRequest) returns (GetUserRankResponse);
+}
+
+message GetLeaderboardRequest {
+  // Maximum number of entries to return (the API accepts 1..100).
+  int32 limit = 1;
+}
+
+// LeaderboardEntry is one display-ready leaderboard row.
+message LeaderboardEntry {
+  // 1-based display rank (position in the descending score order).
+  int32 rank = 1;
+  int32 user_id = 2;
+  // Best score from the Redis projection (integer in [0, 1000000]).
+  int32 score = 3;
+  // Display name resolved from PostgreSQL in one batch lookup. Empty when
+  // the user id no longer exists in PostgreSQL (the entry is still
+  // returned; rank gaps honestly reflect missing users).
+  string name = 4;
+}
+
+message GetLeaderboardResponse {
+  // Descending by score; entry i has rank i+1. Empty is valid.
+  repeated LeaderboardEntry entries = 1;
+}
+
+message GetUserRankRequest {
+  int32 user_id = 1;
+}
+
+message GetUserRankResponse {
+  int32 user_id = 1;
+
+  // ranked distinguishes "not on the board" from "ranked number 1":
+  //   ranked=true  → rank and best_score are set and meaningful
+  //   ranked=false → the user has no leaderboard entry; rank and
+  //                  best_score MUST be ignored (proto3 zero values are
+  //                  placeholders, NOT a rank of 1 or a score of 0)
+  bool ranked = 2;
+
+  // 1-based display rank. Meaningful only when ranked=true.
+  int32 rank = 3;
+
+  // Best score from the Redis projection. Meaningful only when ranked=true.
+  int32 best_score = 4;
+}

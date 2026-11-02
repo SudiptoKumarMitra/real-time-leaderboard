@@ -63,7 +63,7 @@ func (h *LeaderboardHandler) GetLeaderboard(w http.ResponseWriter, r *http.Reque
 		limit = n
 	}
 
-	rows, err := h.Service.GetLeaderboard(limit)
+	rows, err := h.Service.GetLeaderboard(r.Context(), limit)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
@@ -123,7 +123,7 @@ func (h *LeaderboardHandler) GetUserRank(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result, err := h.Service.GetUserRank(userID)
+	result, err := h.Service.GetUserRank(r.Context(), userID)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return

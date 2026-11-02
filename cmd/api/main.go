@@ -1,9 +1,13 @@
 // Command api is the HTTP API service: user registration/login, JWT
 // authentication, score submission (PostgreSQL insert + score.submitted
-// publish), and leaderboard/rank reads from the Redis projection.
+// publish), and leaderboard/rank reads via the gRPC Query Service
+// (leaderboard.v1.LeaderboardQuery). PostgreSQL remains the source of
+// truth for score history; the Query Service fronts the Redis projection
+// in the separate cmd/query process.
 //
 // It never joins the leaderboard-writer consumer group — event consumption
-// runs in the separate cmd/worker process.
+// runs in the separate cmd/worker process — and it never touches Redis
+// directly.
 package main
 
 import (
@@ -19,13 +23,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"real_time_leaderboard/db"
 	"real_time_leaderboard/internal/handler"
 	"real_time_leaderboard/internal/lifecycle"
 	"real_time_leaderboard/internal/middleware"
 	"real_time_leaderboard/internal/publisher"
+	"real_time_leaderboard/internal/queryclient"
 	"real_time_leaderboard/internal/repository"
 	"real_time_leaderboard/internal/service"
 )
@@ -35,22 +38,27 @@ import (
 const httpShutdownTimeout = 10 * time.Second
 
 // Application holds the API's application state, including the database
-// connection pool. It deliberately has no Kafka consumer: consumption
-// belongs to cmd/worker.
+// connection pool and the gRPC query client. It deliberately has no Kafka
+// consumer and no Redis client: consumption belongs to cmd/worker, and
+// leaderboard reads go through the Query Service.
 type Application struct {
-	DB        *sql.DB
-	Redis     *redis.Client
-	Publisher *publisher.EventPublisher
-	Hnd       *handler.UserHandler
-	ScHnd     *handler.ScoreHandler
-	LbHnd     *handler.LeaderboardHandler
-	JWTSecret string
+	DB          *sql.DB
+	QueryClient *queryclient.Client
+	Publisher   *publisher.EventPublisher
+	Hnd         *handler.UserHandler
+	ScHnd       *handler.ScoreHandler
+	LbHnd       *handler.LeaderboardHandler
+	JWTSecret   string
 }
 
-// NewApplication initializes the application with a database connection pool and handler.
-func NewApplication() *Application {
+// NewApplication initializes the application with a database connection
+// pool, a lazy gRPC query client, and handlers. The query client performs
+// no startup health ping — the API comes up even if the Query Service is
+// down (per-request reads then fail over to the existing fallbacks).
+// A malformed QUERY_ADDR returns an error after closing the already
+// opened database pool, so no resource leaks on the failure path.
+func NewApplication() (*Application, error) {
 	databasePool := db.InitDB()
-	redisClient := db.InitRedis()
 
 	// Create repository, service, and handler layers
 	jwtSecret := service.GetJWTSecret()
@@ -59,22 +67,26 @@ func NewApplication() *Application {
 	userHnd := handler.NewUserHandler(userSvc)
 
 	scoreRepo := repository.NewScoreRepository(databasePool)
-	lbRepo := repository.NewLeaderboardRepository(redisClient)
+	queryCl, err := queryclient.New()
+	if err != nil {
+		db.CloseDB(databasePool)
+		return nil, err
+	}
 	eventPub := publisher.NewEventPublisher()
 
-	scoreSvc := service.NewScoreService(*scoreRepo, *lbRepo, *userRepo, eventPub)
+	scoreSvc := service.NewScoreService(*scoreRepo, queryCl, *userRepo, eventPub)
 	scoreHnd := handler.NewScoreHandler(scoreSvc)
 	lbHnd := handler.NewLeaderboardHandler(scoreSvc)
 
 	return &Application{
-		DB:        databasePool,
-		Redis:     redisClient,
-		Publisher: eventPub,
-		Hnd:       userHnd,
-		ScHnd:     scoreHnd,
-		LbHnd:     lbHnd,
-		JWTSecret: jwtSecret,
-	}
+		DB:          databasePool,
+		QueryClient: queryCl,
+		Publisher:   eventPub,
+		Hnd:         userHnd,
+		ScHnd:       scoreHnd,
+		LbHnd:       lbHnd,
+		JWTSecret:   jwtSecret,
+	}, nil
 }
 
 // RegisterRoutes registers HTTP handlers onto the given servemux.
@@ -110,16 +122,22 @@ type HealthResponse struct {
 // run initializes the API application, serves HTTP, and waits for a
 // shutdown trigger. It always runs the full cleanup sequence — gracefully
 // stop the HTTP server first (stop accepting new requests, drain in-flight
-// ones within httpShutdownTimeout), then close the database pool, Redis
-// client, and Kafka writer — and only then returns the process exit code.
-// main() exits with that code so failures surface to the process
-// supervisor. No log.Fatal is used after initialization: errors propagate
-// as exit codes so cleanup always completes first.
+// ones within httpShutdownTimeout), then close the database pool, the
+// gRPC query client, and the Kafka writer — and only then returns the
+// process exit code. main() exits with that code so failures surface to
+// the process supervisor. No log.Fatal is used after initialization:
+// errors propagate as exit codes so cleanup always completes first.
 func run() int {
 	// Initialize the application with database connectivity and handler.
 	// If db.InitDB() fails (e.g., PostgreSQL unreachable), the program exits
-	// before the HTTP server starts, preventing an unhealthy server from serving traffic.
-	app := NewApplication()
+	// before the HTTP server starts, preventing an unhealthy server from
+	// serving traffic. A malformed QUERY_ADDR likewise fails startup —
+	// NewApplication has already closed the database pool at that point.
+	app, err := NewApplication()
+	if err != nil {
+		log.Printf("fatal: %v", err)
+		return 1
+	}
 
 	// Set up the HTTP request routes, passing the handler struct so handlers
 	// can access the service via app.hnd.
@@ -137,7 +155,8 @@ func run() int {
 	fmt.Printf("Login endpoint: POST /login\n")
 	fmt.Printf("Score endpoint: POST /scores (authenticated)\n")
 	fmt.Printf("Leaderboard endpoint: GET /leaderboard\n")
-	fmt.Printf("Leaderboard consumer: separate process (run cmd/worker)\n")
+	fmt.Printf("Leaderboard reads: gRPC query service (QUERY_ADDR, default localhost:50051)\n")
+	fmt.Printf("Leaderboard writer: separate process (run cmd/worker)\n")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -180,7 +199,9 @@ func run() int {
 	}
 
 	db.CloseDB(app.DB)
-	db.CloseRedis(app.Redis)
+	if err := app.QueryClient.Close(); err != nil {
+		log.Printf("warning: failed to close query client: %v", err)
+	}
 	app.Publisher.Close()
 	log.Println("shutdown complete")
 	return exitCode
