@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: leaderboard
+  labels:
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/part-of: real-time-leaderboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/part-of: real-time-leaderboard
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      initContainers:
+        - name: wait-for-redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-ec"]
+          args:
+            - until REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli -h redis ping | grep -q PONG; do sleep 2; done
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: leaderboard-secrets
+                  key: REDIS_PASSWORD
+        - name: wait-for-kafka
+          image: apache/kafka:4.3.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-ec"]
+          args:
+            - until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 >/dev/null 2>&1; do sleep 2; done
+      containers:
+        - name: worker
+          image: leaderboard-worker:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: REDIS_ADDR
+              value: redis:6379
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: leaderboard-secrets
+                  key: REDIS_PASSWORD
+            - name: REDIS_DB
+              value: "0"
+            - name: KAFKA_BROKERS
+              value: kafka:29092
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 192Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

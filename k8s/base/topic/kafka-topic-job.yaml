@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topic-init
+  namespace: leaderboard
+  labels:
+    app.kubernetes.io/name: kafka-topic-init
+    app.kubernetes.io/part-of: real-time-leaderboard
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka-topic-init
+        app.kubernetes.io/part-of: real-time-leaderboard
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+        - name: topic-init
+          image: apache/kafka:4.3.1
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-ec"]
+          args:
+            - |
+              until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:29092 >/dev/null 2>&1; do
+                sleep 2
+              done
+              /opt/kafka/bin/kafka-topics.sh \
+                --bootstrap-server kafka:29092 \
+                --create --if-not-exists \
+                --topic score.submitted \
+                --partitions 2 \
+                --replication-factor 1
+              description="$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --describe --topic score.submitted)"
+              printf '%s\n' "$description"
+              printf '%s\n' "$description" | grep -Eq 'PartitionCount:[[:space:]]*2([[:space:]]|$)'
+              printf '%s\n' "$description" | grep -Eq 'ReplicationFactor:[[:space:]]*1([[:space:]]|$)'
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi

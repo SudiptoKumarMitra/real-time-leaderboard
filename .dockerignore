@@ -1,0 +1,41 @@
+# Version control and local configuration/secrets
+.git
+.env
+.env.*
+!.env.example
+
+# Standalone binaries and build/test output
+/api
+/query
+/worker
+/leaderboard-api
+/leaderboard-query
+/leaderboard-worker
+/bin/
+/dist/
+*.test
+*.out
+coverage*
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+*.tmp
+*.swp
+
+# Local development data, dumps, and persisted service state
+data/
+local-data/
+pgdata/
+redis-data/
+kafka-data/
+*.sql.gz
+*.dump
+*.backup
