@@ -1,5 +1,7 @@
 # Real-Time Leaderboard
 
+[![CI](https://github.com/SudiptoKumarMitra/real-time-leaderboard/actions/workflows/ci.yml/badge.svg)](https://github.com/SudiptoKumarMitra/real-time-leaderboard/actions/workflows/ci.yml)
+
 A Go leaderboard system split into three independently runnable applications:
 
 - **API** (`cmd/api`): HTTP registration, login, score submission, and leaderboard endpoints. It writes score history to PostgreSQL and publishes `score.submitted` events to Kafka. Leaderboard reads use the Query Service through gRPC; the gRPC client connects lazily.
@@ -13,6 +15,10 @@ Compose also runs PostgreSQL 17, Redis 7, and Apache Kafka 4.3.1 in a single-nod
 - Docker Desktop with WSL integration enabled for this distribution, or a working Docker Engine.
 - Docker Compose v2 or later.
 - `curl` for the API health request; `grpcurl` is optional for a Query Service health request.
+
+## Continuous integration
+
+The GitHub Actions workflow at `.github/workflows/ci.yml` runs on pushes and pull requests targeting `main` or `feature/**`, and can also be started manually. It uses the Go version declared in `go.mod` and checks tests (including the race detector), build, and vet. It validates Compose using the safe placeholders in `.env.example`, builds the API, Query Service, and Worker Docker targets locally without publishing images, and renders the root and each Kind Kustomize stage. CI does not need `.env`, real credentials, or access to a Kubernetes cluster, and it does not deploy or publish releases.
 
 ## Local environment
 
