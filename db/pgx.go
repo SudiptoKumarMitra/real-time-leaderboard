@@ -3,11 +3,10 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"log"
 	"os"
 	"time"
-	_ "github.com/jackc/pgx/v5/stdlib"
-
 )
 
 // InitDB opens a connection to PostgreSQL and verifies it with a Ping.

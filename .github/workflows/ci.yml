@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+      - 'feature/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Go, Docker, and Kubernetes validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Go validation
+        run: |
+          go test ./...
+          go test -race ./...
+          go build ./...
+          go vet ./...
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Validate Docker Compose configuration
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: Build application images without publishing
+        run: |
+          docker buildx build --load --target api --tag leaderboard-api:ci .
+          docker buildx build --load --target query --tag leaderboard-query:ci .
+          docker buildx build --load --target worker --tag leaderboard-worker:ci .
+
+      - name: Set up kubectl and Kustomize
+        uses: Azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.34.0
+
+      - name: Render Kubernetes manifests
+        run: |
+          kubectl kustomize k8s/overlays/kind
+          kubectl kustomize k8s/overlays/kind/infra
+          kubectl kustomize k8s/overlays/kind/topic
+          kubectl kustomize k8s/overlays/kind/query
+          kubectl kustomize k8s/overlays/kind/apps
