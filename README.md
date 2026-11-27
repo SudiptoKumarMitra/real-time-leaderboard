@@ -38,27 +38,21 @@ The API owns HTTP registration, login, score submission, and leaderboard endpoin
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    actor Client as External client
+    actor Client
     participant API as API service
     participant PG as PostgreSQL
     participant Kafka
     participant Worker
     participant Redis
-    Client->>API: POST /scores + Bearer JWT + score
-    API->>API: Validate JWT and score (0..1,000,000)
-    API->>PG: Insert score; return id and created_at
-    PG-->>API: Persisted score row
-    API->>Kafka: Publish score.submitted (key=user_id)
-    alt Kafka publish succeeds
-        Kafka-->>API: Acknowledgment
-    else Kafka publish fails after retries/timeout
-        API-->>Client: Still returns 201; log warning
-    end
-    API-->>Client: 201 {status, score_id, score}
-    Kafka->>Worker: Deliver event in leaderboard-writer group
+    Client->>API: POST /scores with Bearer JWT and score
+    API->>API: Validate JWT and score (0 to 1000000)
+    API->>PG: Insert score
+    PG-->>API: Return score ID and created_at
+    API->>Kafka: Publish score.submitted event
+    Note over API,Kafka: Publish is best effort after the database insert
+    API-->>Client: 201 with status, score_id, and score
+    Kafka->>Worker: Deliver score.submitted event
     Worker->>Redis: ZADD leaderboard GT score user_id
-    Redis-->>Worker: Update result
     Worker->>Kafka: Commit offset after processing
 ```
 
